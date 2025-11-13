@@ -8,6 +8,8 @@ from .wandb import WandbConfig
 
 
 class NavierStokesOptConfig(OptimizationConfig):
+    """
+    Default:
     n_epochs: int = 600
     learning_rate: float = 3e-4
     training_loss: str = "h1"
@@ -15,9 +17,19 @@ class NavierStokesOptConfig(OptimizationConfig):
     scheduler: str = "StepLR"
     step_size: int = 100
     gamma: float = 0.5
+    """
+    n_epochs: int = 4
+    learning_rate: float = 1e-3
+    training_loss: str = "l2"
+    weight_decay: float = 1e-4
+    scheduler: str = "StepLR"
+    step_size: int = 5
+    gamma: float = 0.7
 
 
 class NavierStokesDatasetConfig(ConfigBase):
+    """
+    Default:
     folder: str = "~/data/navier_stokes/"
     batch_size: int = 8
     n_train: int = 10000
@@ -27,6 +39,18 @@ class NavierStokesDatasetConfig(ConfigBase):
     test_batch_sizes: List[int] = [8]
     encode_input: bool = True
     encode_output: bool = True
+    """
+    folder: str = "~/data/navier_stokes/"
+    batch_size: int = 8
+    n_train: int = 100
+    train_resolution: int = 128
+    n_tests: List[int] = [50]
+    test_resolutions: List[int] = [128]
+    test_batch_sizes: List[int] = [8]
+    encode_input: bool = True
+    encode_output: bool = True
+
+
 
 
 class Default(ConfigBase):
