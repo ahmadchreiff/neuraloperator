@@ -49,8 +49,24 @@ class NavierStokesDatasetConfig(ConfigBase):
     test_batch_sizes: List[int] = [8]
     encode_input: bool = True
     encode_output: bool = True
-
-
+ 
+ 
+class NavierStokesPhysicsLossConfig(ConfigBase):
+    enabled: bool = False
+    viscosity: float = 0.001
+    dx: float = 1.0
+    dy: float = 1.0
+    dt: float = 1.0
+    advection_weight: float = 1.0
+    diffusion_weight: float = 1.0
+    forcing_weight: float = 0.0
+    use_vorticity_form: bool = True
+    derivative_mode: str = "spectral"
+    denormalize: bool = True
+    initial_weight: float = 0.0
+    max_weight: float = 1.0
+    warmup_epochs: int = 50
+    weight_schedule: str = "none"
 
 
 class Default(ConfigBase):
@@ -60,5 +76,6 @@ class Default(ConfigBase):
     model: ModelConfig = FNO_Medium2d()
     opt: OptimizationConfig = NavierStokesOptConfig()
     data: NavierStokesDatasetConfig = NavierStokesDatasetConfig()
+    physics_loss: NavierStokesPhysicsLossConfig = NavierStokesPhysicsLossConfig()
     patching: PatchingConfig = PatchingConfig()
     wandb: WandbConfig = WandbConfig()

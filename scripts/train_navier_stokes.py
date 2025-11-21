@@ -15,11 +15,12 @@ import torch.distributed as dist
 import wandb
 
 from neuralop import H1Loss, LpLoss, Trainer, get_model
+from neuralop.losses.equation_losses import NavierStokesEqnLoss
 from neuralop.data.datasets.navier_stokes import load_navier_stokes_pt
 from neuralop.data.transforms.data_processors import MGPatchingDataProcessor
 from neuralop.utils import get_wandb_api_key, count_model_params
 from neuralop.mpu.comm import get_local_rank
-from neuralop.training import setup, AdamW
+from neuralop.training import setup, AdamW, PhysicsWeightScheduler
 
 # Configuration setup
 config_name = "default"
@@ -31,6 +32,16 @@ from config.navier_stokes_config import Default
 
 config = make_config_from_cli(Default)
 config = config.to_dict()
+
+physics_mode = "baseline"
+if config.physics_loss.enabled:
+    if config.physics_loss.weight_schedule == "linear_warmup":
+        physics_mode = "phy_adaptive"
+    elif config.physics_loss.weight_schedule == "plateau":
+        physics_mode = "phy_plateau"
+    else:
+        physics_mode = "phy_fixed"
+config.physics_run_mode = physics_mode
 
 # Distributed training setup, if enabled
 device, is_logger = setup(config)
@@ -47,6 +58,7 @@ if config.wandb.log and is_logger:
         wandb_name = "_".join(
             f"{var}"
             for var in [
+                physics_mode,
                 config_name,
                 config.model.n_layers,
                 config.model.n_modes,
@@ -167,6 +179,40 @@ else:
     )
 eval_losses = {"h1": h1loss, "l2": l2loss}
 
+phy_loss_fn = None
+phy_scheduler = None
+physics_weight = 0.0
+phy_normalizer_train = None
+phy_normalizer_eval = None
+if config.physics_loss.enabled:
+    phy_loss_fn = NavierStokesEqnLoss(
+        viscosity=config.physics_loss.viscosity,
+        dx=config.physics_loss.dx,
+        dy=config.physics_loss.dy,
+        dt=config.physics_loss.dt,
+        advection_weight=config.physics_loss.advection_weight,
+        diffusion_weight=config.physics_loss.diffusion_weight,
+        forcing_weight=config.physics_loss.forcing_weight,
+        use_vorticity_form=config.physics_loss.use_vorticity_form,
+        derivative_mode=config.physics_loss.derivative_mode,
+        denormalize=config.physics_loss.denormalize,
+    )
+    physics_weight = config.physics_loss.initial_weight
+    if config.physics_loss.weight_schedule in ["linear_warmup", "plateau"]:
+        phy_scheduler = PhysicsWeightScheduler(
+            initial_weight=config.physics_loss.initial_weight,
+            max_weight=config.physics_loss.max_weight,
+            warmup_epochs=config.physics_loss.warmup_epochs,
+            mode=config.physics_loss.weight_schedule,
+        )
+    if config.physics_loss.denormalize and not isinstance(
+        data_processor, MGPatchingDataProcessor
+    ):
+        phy_normalizer_train = getattr(data_processor, "out_normalizer", None)
+    phy_normalizer_eval = (
+        None if not isinstance(data_processor, MGPatchingDataProcessor) else phy_normalizer_train
+    )
+
 if config.verbose:
     print("\n### MODEL ###\n", model)
     print("\n### OPTIMIZER ###\n", optimizer)
@@ -174,6 +220,13 @@ if config.verbose:
     print("\n### LOSSES ###")
     print(f"\n * Train: {train_loss}")
     print(f"\n * Test: {eval_losses}")
+    if phy_loss_fn is not None:
+        print(
+            f"\n * Physics: enabled (schedule={config.physics_loss.weight_schedule}, "
+            f"w0={physics_weight})"
+        )
+    else:
+        print("\n * Physics: disabled")
     print(f"\n### Beginning Training...\n")
     sys.stdout.flush()
 
@@ -218,6 +271,13 @@ trainer.train(
     regularizer=False,
     training_loss=train_loss,
     eval_losses=eval_losses,
+    physics_loss_fn=phy_loss_fn,
+    physics_weight=physics_weight,
+    physics_weight_scheduler=phy_scheduler,
+    physics_normalizer_train=phy_normalizer_train,
+    physics_normalizer_eval=phy_normalizer_eval,
+    physics_return_components=True,
+    eval_physics_loss=bool(phy_loss_fn),
 )
 
 # Finalize WandB logging

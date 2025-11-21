@@ -1,5 +1,5 @@
 from .data_losses import LpLoss, H1Loss
-from .equation_losses import BurgersEqnLoss, ICLoss
+from .equation_losses import BurgersEqnLoss, ICLoss, NavierStokesEqnLoss
 from .differentiation import FourierDiff, non_uniform_fd, FiniteDiff
 from .meta_losses import (
     WeightedSumLoss,

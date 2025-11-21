@@ -161,18 +161,16 @@ If W&B is enabled, logs losses/metrics and model parameters. Console prints loss
 
 ---
 
-## Where to add a physics-informed Navier–Stokes loss
-- Implement in `neuralop/losses/equation_losses.py` (see `BurgersEqnLoss` for a template). The data pipeline already provides normalized `x`/`y`; decide whether to work in normalized or physical units.
-- Wire it in `scripts/train_navier_stokes.py`:
-  1. Instantiate your `NavierStokesEqnLoss` alongside `LpLoss`/`H1Loss`.
-  2. Combine losses (e.g., weighted sum) before backprop.
-  3. Optionally log the physics residual separately.
-- Required ingredients for residuals:
-  - The dataset only stores vorticity; velocity/pressure are not available. To enforce NSE you can:
-    * Work in vorticity form (need spatial derivatives of vorticity; grid spacing is implicitly 1.0 on a unit square with periodic BCs).
-    * Or reconstruct velocity from vorticity via stream-function Poisson solve (not present in repo, would need to add).
-  - Use periodic finite differences consistent with `H1Loss` (periodic in x/y by default).
-- If you need normalization-aware derivatives, either denormalize inside the loss or bake mean/std into the differential operator.
+## Physics-informed loss and adaptive weighting
+- Loss: `NavierStokesEqnLoss` (vorticity form) lives in `neuralop/losses/equation_losses.py`; supports spectral or periodic finite differences, optional denormalization via the dataset normalizer, and logs advection/diffusion/residual components.
+- Weighting: `PhysicsWeightScheduler` (`neuralop/training/schedulers.py`) supports `none`, `linear_warmup`, and a simple `plateau` trigger. The trainer logs `avg_physics_loss`, per-component means, and `physics_weight` each epoch.
+- Config: toggle everything under `config.physics_loss` (viscosity, dx/dy/dt, derivative mode, component weights, initial/max weight, warmup epochs, schedule). CLI override example:
+  `python scripts/train_navier_stokes.py --physics_loss.enabled True --physics_loss.weight_schedule linear_warmup --physics_loss.initial_weight 0.1 --physics_loss.max_weight 1.0 --physics_loss.warmup_epochs 50`
+- Run labels: default W&B names are prefixed with `baseline` (physics off), `phy_fixed` (physics on, fixed weight), or `phy_adaptive` (scheduled weight). Validation metrics now include `physics` entries per resolution, e.g., `128_physics`, `128_physics_loss_residual`, `128_physics_loss_adv`.
+- Comparison recipe:
+  - Baseline: `--physics_loss.enabled False`
+  - Fixed physics: `--physics_loss.enabled True --physics_loss.weight_schedule none --physics_loss.initial_weight 1.0 --physics_loss.max_weight 1.0`
+  - Adaptive physics: `--physics_loss.enabled True --physics_loss.weight_schedule linear_warmup --physics_loss.initial_weight 0.1 --physics_loss.max_weight 1.0 --physics_loss.warmup_epochs 50`
 
 ---
 

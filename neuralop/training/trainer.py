@@ -95,6 +95,18 @@ class Trainer:
         # Track starting epoch for checkpointing/resuming
         self.start_epoch = 0
 
+        # Optional physics-aware training attributes
+        self.physics_loss_fn = None
+        self.physics_weight_scheduler = None
+        self.physics_weight = 0.0
+        self.current_physics_weight = 0.0
+        self.physics_normalizer_train = None
+        self.physics_normalizer_eval = None
+        self.physics_return_components = False
+        self.compute_eval_physics = False
+        self.loss_history = {}
+        self.latest_train_metrics = {}
+
     def train(
         self,
         train_loader,
@@ -110,6 +122,13 @@ class Trainer:
         save_dir: Union[str, Path] = "./ckpt",
         resume_from_dir: Union[str, Path] = None,
         max_autoregressive_steps: int = None,
+        physics_loss_fn=None,
+        physics_weight: float = 0.0,
+        physics_weight_scheduler=None,
+        physics_normalizer_train=None,
+        physics_normalizer_eval=None,
+        physics_return_components: bool = False,
+        eval_physics_loss: bool = False,
     ):
         """Trains the given model on the given dataset.
 
@@ -168,6 +187,21 @@ class Trainer:
             self.regularizer = regularizer
         else:
             self.regularizer = None
+
+        self.physics_loss_fn = physics_loss_fn
+        self.physics_weight_scheduler = physics_weight_scheduler
+        self.physics_weight = physics_weight if physics_loss_fn is not None else 0.0
+        self.current_physics_weight = self.physics_weight
+        self.physics_normalizer_train = physics_normalizer_train
+        self.physics_normalizer_eval = (
+            physics_normalizer_eval
+            if physics_normalizer_eval is not None
+            else physics_normalizer_train
+        )
+        self.physics_return_components = physics_return_components
+        self.compute_eval_physics = eval_physics_loss and physics_loss_fn is not None
+        self.loss_history = {"data_loss": [], "physics_loss": []}
+        self.latest_train_metrics = {}
 
         if training_loss is None:
             training_loss = LpLoss(d=2)
@@ -239,6 +273,12 @@ class Trainer:
                 avg_lasso_loss=avg_lasso_loss,
                 epoch_train_time=epoch_train_time,
             )
+            for key, value in self.latest_train_metrics.items():
+                if key == "physics_components":
+                    for comp_name, comp_val in value.items():
+                        epoch_metrics[f"physics_{comp_name}"] = comp_val
+                else:
+                    epoch_metrics[key] = value
 
             if epoch % self.eval_interval == 0:
                 # evaluate and gather metrics across each loader in test_loaders
@@ -293,8 +333,21 @@ class Trainer:
         # track number of training examples in batch
         self.n_samples = 0
 
+        if self.physics_loss_fn is not None:
+            if self.physics_weight_scheduler is not None:
+                self.current_physics_weight = self.physics_weight_scheduler.step(
+                    epoch, history=self.loss_history
+                )
+            else:
+                self.current_physics_weight = self.physics_weight
+        else:
+            self.current_physics_weight = 0.0
+
+        avg_data_loss = 0.0
+        avg_physics_loss = 0.0
+        physics_component_sums = {}
         for idx, sample in enumerate(train_loader):
-            loss = self.train_one_batch(idx, sample, training_loss)
+            loss, step_metrics = self.train_one_batch(idx, sample, training_loss)
             loss.backward()
             self.optimizer.step()
 
@@ -303,6 +356,13 @@ class Trainer:
                 avg_loss += loss.item()
                 if self.regularizer:
                     avg_lasso_loss += self.regularizer.loss
+                avg_data_loss += float(step_metrics.get("data_loss", 0.0))
+                if self.physics_loss_fn is not None:
+                    avg_physics_loss += float(step_metrics.get("physics_loss", 0.0))
+                    for name, value in step_metrics.get("physics_components", {}).items():
+                        physics_component_sums[name] = physics_component_sums.get(
+                            name, 0.0
+                        ) + float(value)
 
         if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             self.scheduler.step(train_err)
@@ -313,14 +373,32 @@ class Trainer:
 
         train_err /= len(train_loader)
         avg_loss /= self.n_samples
+        avg_data_loss /= self.n_samples
         if self.regularizer:
             avg_lasso_loss /= self.n_samples
         else:
             avg_lasso_loss = None
+        if self.physics_loss_fn is not None:
+            avg_physics_loss /= self.n_samples
+            physics_component_avgs = {
+                name: value / self.n_samples for name, value in physics_component_sums.items()
+            }
+        else:
+            avg_physics_loss = None
+            physics_component_avgs = {}
 
         lr = None
         for pg in self.optimizer.param_groups:
             lr = pg["lr"]
+        self.latest_train_metrics = dict(
+            avg_data_loss=avg_data_loss,
+            avg_physics_loss=avg_physics_loss,
+            physics_weight=self.current_physics_weight,
+            physics_components=physics_component_avgs,
+        )
+        if self.physics_loss_fn is not None:
+            self.loss_history["data_loss"].append(avg_data_loss)
+            self.loss_history["physics_loss"].append(avg_physics_loss)
         if self.verbose and epoch % self.eval_interval == 0:
             self.log_training(
                 epoch=epoch,
@@ -329,6 +407,9 @@ class Trainer:
                 train_err=train_err,
                 avg_lasso_loss=avg_lasso_loss,
                 lr=lr,
+                data_loss=avg_data_loss,
+                physics_loss=avg_physics_loss,
+                physics_weight=self.current_physics_weight,
             )
 
         return train_err, avg_loss, avg_lasso_loss, epoch_train_time
@@ -425,7 +506,7 @@ class Trainer:
         if self.data_processor:
             self.data_processor.eval()
 
-        errors = {f"{log_prefix}_{loss_name}": 0 for loss_name in loss_dict.keys()}
+        errors = {}
 
         # Warn the user if any of the eval losses is reducing across the batch
         for _, eval_loss in loss_dict.items():
@@ -456,6 +537,7 @@ class Trainer:
                     )
 
                 for loss_name, val_loss in eval_step_losses.items():
+                    errors.setdefault(f"{log_prefix}_{loss_name}", 0)
                     errors[f"{log_prefix}_{loss_name}"] += val_loss
 
         for key in errors.keys():
@@ -541,14 +623,49 @@ class Trainer:
         #     loss += training_loss(out, **sample)
         if self.mixed_precision:
             with torch.autocast(device_type=self.autocast_device_type):
-                loss += training_loss(out, sample["y"])
+                data_loss = training_loss(out, sample["y"])
         else:
-            loss += training_loss(out, sample["y"])
+            data_loss = training_loss(out, sample["y"])
+
+        physics_loss = torch.tensor(0.0, device=out.device)
+        physics_components = {}
+        if self.physics_loss_fn is not None:
+            if self.mixed_precision:
+                with torch.autocast(device_type=self.autocast_device_type):
+                    phy_out = self.physics_loss_fn(
+                        out,
+                        sample,
+                        normalizer=self.physics_normalizer_train,
+                        return_components=self.physics_return_components,
+                    )
+            else:
+                phy_out = self.physics_loss_fn(
+                    out,
+                    sample,
+                    normalizer=self.physics_normalizer_train,
+                    return_components=self.physics_return_components,
+                )
+            if isinstance(phy_out, tuple):
+                physics_loss, physics_components = phy_out
+            else:
+                physics_loss = phy_out
+
+        loss = data_loss + self.current_physics_weight * physics_loss
 
         if self.regularizer:
             loss += self.regularizer.loss
 
-        return loss
+        step_metrics = {
+            "data_loss": data_loss.detach(),
+            "physics_loss": physics_loss.detach(),
+            "physics_components": {
+                name: value.detach() for name, value in physics_components.items()
+            }
+            if physics_components
+            else {},
+        }
+
+        return loss, step_metrics
 
     def eval_one_batch(
         self, sample: dict, eval_losses: dict, return_output: bool = False
@@ -593,6 +710,21 @@ class Trainer:
             val_loss = loss(out, sample["y"])
             eval_step_losses[loss_name] = val_loss
 
+        if self.compute_eval_physics and self.physics_loss_fn is not None:
+            phy_out = self.physics_loss_fn(
+                out,
+                sample,
+                normalizer=self.physics_normalizer_eval,
+                return_components=self.physics_return_components,
+            )
+            if isinstance(phy_out, tuple):
+                phy_loss, phy_components = phy_out
+            else:
+                phy_loss, phy_components = phy_out, {}
+            eval_step_losses["physics"] = phy_loss
+            for name, value in phy_components.items():
+                eval_step_losses[f"physics_{name}"] = value
+
         if return_output:
             return eval_step_losses, out
         else:
@@ -636,6 +768,8 @@ class Trainer:
         """
         eval_step_losses = {loss_name: 0.0 for loss_name in eval_losses.keys()}
         # eval_rollout_losses = {loss_name: 0. for loss_name in eval_losses.keys()}
+        physics_loss_total = 0.0
+        physics_component_totals = {}
 
         t = 0
         if max_steps is None:
@@ -673,11 +807,31 @@ class Trainer:
                 # step_loss = loss(out, **sample)
                 step_loss = loss(out, sample["y"])
                 eval_step_losses[loss_name] += step_loss
+            if self.compute_eval_physics and self.physics_loss_fn is not None:
+                phy_out = self.physics_loss_fn(
+                    out,
+                    sample,
+                    normalizer=self.physics_normalizer_eval,
+                    return_components=self.physics_return_components,
+                )
+                if isinstance(phy_out, tuple):
+                    phy_loss, phy_components = phy_out
+                else:
+                    phy_loss, phy_components = phy_out, {}
+                physics_loss_total += phy_loss
+                for name, value in phy_components.items():
+                    physics_component_totals[name] = (
+                        physics_component_totals.get(name, 0.0) + value
+                    )
 
             t += 1
         # average over all steps of the final rollout
         for loss_name in eval_step_losses.keys():
             eval_step_losses[loss_name] /= t
+        if self.compute_eval_physics and self.physics_loss_fn is not None and t > 0:
+            eval_step_losses["physics"] = physics_loss_total / t
+            for name, value in physics_component_totals.items():
+                eval_step_losses[f"physics_{name}"] = value / t
 
         if return_output:
             return eval_step_losses, out
@@ -692,6 +846,9 @@ class Trainer:
         train_err: float,
         avg_lasso_loss: float = None,
         lr: float = None,
+        data_loss: float = None,
+        physics_loss: float = None,
+        physics_weight: float = None,
     ):
         """Basic method to log results
         from a single training epoch.
@@ -720,12 +877,24 @@ class Trainer:
                 avg_lasso_loss=avg_lasso_loss,
                 lr=lr,
             )
+            if data_loss is not None:
+                values_to_log["avg_data_loss"] = data_loss
+            if physics_loss is not None:
+                values_to_log["avg_physics_loss"] = physics_loss
+            if physics_weight is not None:
+                values_to_log["physics_weight"] = physics_weight
 
         msg = f"[{epoch}] time={time:.2f}, "
         msg += f"avg_loss={avg_loss:.4f}, "
         msg += f"train_err={train_err:.4f}"
         if avg_lasso_loss is not None:
             msg += f", avg_lasso={avg_lasso_loss:.4f}"
+        if data_loss is not None:
+            msg += f", data_loss={data_loss:.4f}"
+        if physics_loss is not None:
+            msg += f", physics_loss={physics_loss:.4f}"
+        if physics_weight is not None:
+            msg += f", w_phy={physics_weight:.4f}"
 
         print(msg)
         sys.stdout.flush()
