@@ -1,5 +1,5 @@
 """
-Run baseline, physics/fixed, and physics/adaptive Navier–Stokes experiments sequentially
+Run baseline, physics/fixed, and physics/adaptive Navier-Stokes experiments sequentially
 and save metrics/plots for presentation (Colab-friendly).
 
 Example (Colab):
