@@ -33,12 +33,12 @@ from neuralop.training.trainer import Trainer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Batch Navier–Stokes runs (baseline vs physics)")
+    parser = argparse.ArgumentParser(description="Batch Navier-Stokes runs (baseline vs physics)")
     parser.add_argument(
         "--data-root",
         type=pathlib.Path,
         default=pathlib.Path("~/data/navier_stokes").expanduser(),
-        help="Path to Navier–Stokes dataset folder",
+        help="Path to Navier-Stokes dataset folder",
     )
     parser.add_argument(
         "--output-root",
@@ -149,7 +149,7 @@ class LoggingTrainer(Trainer):
 def run_experiment(run_name: str, physics_cfg: Dict[str, Any], cfg: Default, device, data_root: pathlib.Path):
     if not data_root.exists():
         raise FileNotFoundError(
-            f"DATA_ROOT {data_root} not found. Copy/mount your Navier–Stokes dataset there or pass --data-root."
+            f"DATA_ROOT {data_root} not found. Copy/mount your Navier-Stokes dataset there or pass --data-root."
         )
 
     cfg = cfg.copy() if hasattr(cfg, "copy") else cfg  # defensive
