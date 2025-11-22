@@ -1,6 +1,6 @@
 # Navier–Stokes Physics-Informed Extension – Detailed Report
 
-This document summarizes the features recently added to the Navier–Stokes pipeline: physics-informed loss (NavierStokesEqnLoss), adaptive physics weighting, trainer and config wiring, metrics/logging, tests, and how to run comparisons.
+This document summarizes the features added to the Navier–Stokes pipeline: physics-informed loss (NavierStokesEqnLoss), adaptive physics weighting, trainer and config wiring, metrics/logging, tests, and how to run comparisons.
 
 ---
 
