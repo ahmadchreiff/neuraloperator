@@ -391,16 +391,21 @@ class NavierStokesEqnLoss(nn.Module):
             prediction = normalizer.inverse_transform(prediction)
 
         batch, time, channels, height, width = prediction.shape
-        if channels < 2:
-            raise ValueError(
-                f"NavierStokesEqnLoss expects at least 2 channels for velocity, got {channels}"
-            )
+        vorticity_only = channels == 1
+        if channels < 1:
+            raise ValueError("NavierStokesEqnLoss expects at least 1 channel.")
         if not self.use_vorticity_form:
             raise NotImplementedError("Only vorticity form is implemented.")
 
-        u_x = prediction[:, :, 0]
-        u_y = prediction[:, :, 1]
-        omega = self._grad_x(u_y) - self._grad_y(u_x)
+        if vorticity_only:
+            # Dataset carries only vorticity; fall back to zero velocity (no advection).
+            omega = prediction[:, :, 0]
+            u_x = torch.zeros_like(omega)
+            u_y = torch.zeros_like(omega)
+        else:
+            u_x = prediction[:, :, 0]
+            u_y = prediction[:, :, 1]
+            omega = self._grad_x(u_y) - self._grad_y(u_x)
 
         omega_t = self._time_derivative(omega)
         omega_x = self._grad_x(omega)
