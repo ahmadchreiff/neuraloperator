@@ -299,11 +299,14 @@ class FNO(BaseModel, name="FNO"):
         )
 
         ## Lifting layer
-        # if adding a positional embedding, add those channels to lifting
+        # If we're using positional embeddings, increase the number of input channels by the number of spatial dimensions.
         lifting_in_channels = self.in_channels
         if self.positional_embedding is not None:
             lifting_in_channels += self.n_dim
-        # if lifting_channels is passed, make lifting a Channel-Mixing MLP
+        
+        # Create the lifting layer
+        # lifting_channel is the number of channels in the lifting layer. It’s the number of channels (features) in that expanded space after the lifting operation.
+        # If lifting_channels is passed, make a Channel-Mixing MLP for the lifting
         # with a hidden layer of size lifting_channels
         if self.lifting_channels:
             self.lifting = ChannelMLP(
@@ -325,6 +328,8 @@ class FNO(BaseModel, name="FNO"):
                 non_linearity=non_linearity,
             )
         # Convert lifting to a complex ChannelMLP if self.complex_data==True
+        # ComplexValued is a wrapper that makes a ChannelMLP handle complex-valued data.
+        # Take the lifting network (which normally handles real tensors) and wrap it in a version that can handle complex-valued tensors.
         if self.complex_data:
             self.lifting = ComplexValued(self.lifting)
 
