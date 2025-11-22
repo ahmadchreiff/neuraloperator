@@ -182,7 +182,8 @@ def run_experiment(run_name: str, physics_cfg: Dict[str, Any], cfg: Default, dev
         num_workers=2,
     )
 
-    model = get_model(cfg).to(device)
+    # get_model expects mapping-style config; convert if available
+    model = get_model(cfg.to_dict() if hasattr(cfg, "to_dict") else cfg).to(device)
     if cfg.patching.levels > 0:
         data_processor = MGPatchingDataProcessor(
             model=model,
