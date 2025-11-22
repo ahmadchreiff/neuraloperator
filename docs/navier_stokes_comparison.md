@@ -6,16 +6,14 @@ This is a runnable cheat-sheet for the Navier–Stokes pipeline with the physics
 - **Baseline (data-only)**  
   ```bash
   python scripts/train_navier_stokes.py \
-    --physics_loss.enabled False \
-    --wandb.log True --wandb.name ns_baseline_128
+    --physics_loss.enabled False
   ```
 - **Physics / fixed weight**  
   ```bash
   python scripts/train_navier_stokes.py \
     --physics_loss.enabled True \
     --physics_loss.weight_schedule none \
-    --physics_loss.initial_weight 1.0 --physics_loss.max_weight 1.0 \
-    --wandb.log True --wandb.name ns_phy_fixed_128
+    --physics_loss.initial_weight 1.0 --physics_loss.max_weight 1.0
   ```
 - **Physics / adaptive (linear warmup)**  
   ```bash
@@ -23,8 +21,7 @@ This is a runnable cheat-sheet for the Navier–Stokes pipeline with the physics
     --physics_loss.enabled True \
     --physics_loss.weight_schedule linear_warmup \
     --physics_loss.initial_weight 0.1 --physics_loss.max_weight 1.0 \
-    --physics_loss.warmup_epochs 50 \
-    --wandb.log True --wandb.name ns_phy_adaptive_128
+    --physics_loss.warmup_epochs 50
   ```
 
 Adjust `--data.folder` to your dataset location. Increase `--opt.n_epochs` / `--data.n_train` for full runs.
