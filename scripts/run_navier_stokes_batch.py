@@ -22,6 +22,7 @@ matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 import pandas as pd
 import torch
+from torch.utils.data import DataLoader, random_split
 
 from config.navier_stokes_config import Default
 from neuralop import H1Loss, LpLoss, get_model
@@ -79,6 +80,12 @@ def parse_args():
         type=int,
         default=128,
         help="Evaluation resolution (default 128).",
+    )
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.1,
+        help="Fraction of training data to hold out for validation (0 disables).",
     )
     parser.add_argument(
         "--seed",
@@ -181,6 +188,39 @@ def run_experiment(run_name: str, physics_cfg: Dict[str, Any], cfg: Default, dev
         encode_output=cfg.data.encode_output,
         num_workers=2,
     )
+
+    # Optional train/validation split
+    val_fraction = getattr(cfg, "val_fraction", 0.0)
+    if val_fraction and val_fraction > 0 and val_fraction < 1:
+        total = len(train_loader.dataset)
+        if total > 1:
+            val_size = max(1, int(val_fraction * total))
+            val_size = min(val_size, total - 1)
+            train_size = total - val_size
+            train_subset, val_subset = random_split(
+                train_loader.dataset,
+                [train_size, val_size],
+                generator=torch.Generator().manual_seed(getattr(cfg, "seed", 0)),
+            )
+            train_loader = DataLoader(
+                train_subset,
+                batch_size=cfg.data.batch_size,
+                shuffle=True,
+                num_workers=train_loader.num_workers,
+                pin_memory=False,
+                persistent_workers=False,
+            )
+            val_loader = DataLoader(
+                val_subset,
+                batch_size=cfg.data.batch_size,
+                shuffle=False,
+                num_workers=train_loader.num_workers,
+                pin_memory=False,
+                persistent_workers=False,
+            )
+            # Add validation loader under a dedicated key
+            test_loaders = dict(test_loaders)
+            test_loaders["val"] = val_loader
 
     # get_model expects mapping-style config; convert if available
     model = get_model(cfg.to_dict() if hasattr(cfg, "to_dict") else cfg).to(device)
@@ -371,6 +411,8 @@ def main():
     cfg.data.test_resolutions = [args.test_res]
     cfg.data.test_batch_sizes = [test_batch_size]
     cfg.data.n_tests = [min(128, cfg.data.n_tests[0])]
+    cfg.val_fraction = max(0.0, min(0.9, args.val_fraction))
+    cfg.seed = args.seed
     cfg.opt.n_epochs = n_epochs
     cfg.opt.eval_interval = 1
     cfg.opt.mixed_precision = False
@@ -430,6 +472,11 @@ def main():
         f"{args.test_res} residual loss",
         output_root / f"eval_{args.test_res}_residual.png",
     )
+    # Validation curves (if present)
+    plot_eval_metric(all_results, "val_l2", "val_l2 (eval)", output_root / "eval_val_l2.png")
+    plot_eval_metric(all_results, "val_h1", "val_h1 (eval)", output_root / "eval_val_h1.png")
+    plot_eval_metric(all_results, "val_physics", "val physics loss", output_root / "eval_val_physics.png")
+    plot_eval_metric(all_results, "val_physics_loss_residual", "val residual loss", output_root / "eval_val_residual.png")
 
     plot_last_eval_bar(
         all_results,
