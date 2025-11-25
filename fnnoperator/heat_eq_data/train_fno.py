@@ -8,12 +8,15 @@ The model learns to map initial conditions to the final state of the solution.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
 
 from neuralop.models import FNO
 from neuralop import Trainer, LpLoss, H1Loss
@@ -301,6 +304,7 @@ def train(
     use_final_state: bool = True,
     eval_interval: int = 5,
     save_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
 ):
     """Train FNO on heat equation dataset.
     
@@ -386,7 +390,8 @@ def train(
     print(f"  Evaluation: {eval_losses}")
     print()
     
-    # Create trainer
+    # Note: We use a custom training loop instead of Trainer.train()
+    # to track losses for plotting. Trainer object is kept for compatibility.
     trainer = Trainer(
         model=model,
         n_epochs=n_epochs,
@@ -395,41 +400,288 @@ def train(
         wandb_log=False,  # Disable wandb for simplicity
         eval_interval=eval_interval,
         use_distributed=False,
-        verbose=True,
+        verbose=False,  # We print our own progress
     )
-    
-    # Create test loaders dictionary (format expected by Trainer)
-    test_loaders = {"test": test_loader}
     
     # Prepare save directory if provided
     save_dir = Path(save_dir) if save_dir else None
     if save_dir:
         save_dir.mkdir(parents=True, exist_ok=True)
     
-    # Train
-    print("Starting training...")
-    print("=" * 80)
-    train_kwargs = {
-        "train_loader": train_loader,
-        "test_loaders": test_loaders,
-        "optimizer": optimizer,
-        "scheduler": scheduler,
-        "regularizer": False,
-        "training_loss": train_loss,
-        "eval_losses": eval_losses,
+    # Prepare output directory for logs and plots
+    if output_dir is None:
+        if save_dir:
+            output_dir = save_dir
+        else:
+            # Create default output directory
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path(f"fnnoperator/outputs/fno_heat_eq_{dimension}d_{timestamp}")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = output_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize loss tracking
+    history = {
+        "train_loss": [],
+        "train_h1": [],
+        "test_h1": [],
+        "test_l2": [],
+        "epochs": [],
     }
     
-    # Add checkpointing if save_dir is provided
-    if save_dir:
-        train_kwargs["save_every"] = eval_interval  # Save every eval_interval epochs
-        train_kwargs["save_dir"] = save_dir
+    # Custom training loop to track losses
+    print("Starting training...")
+    print("=" * 80)
     
-    trainer.train(**train_kwargs)
+    model.train()
+    for epoch in range(n_epochs):
+        # Training phase
+        model.train()
+        train_losses = []
+        train_h1_losses = []
+        
+        for batch in train_loader:
+            optimizer.zero_grad()
+            
+            # Preprocess data (data_processor expects and returns a dict)
+            if data_processor is not None:
+                data_processor.train()  # Set to training mode for normalization
+                batch = data_processor.preprocess(batch)
+                x = batch["x"]
+                y = batch["y"]
+            else:
+                x = batch["x"].to(device)
+                y = batch["y"].to(device)
+            
+            # Forward pass
+            out = model(x)
+            
+            if data_processor is not None:
+                out, _ = data_processor.postprocess(out, batch)
+            
+            # Compute losses
+            loss = train_loss(out, y)
+            h1_val = h1_loss(out, y)
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            
+            train_losses.append(loss.item())
+            train_h1_losses.append(h1_val.item())
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Average training losses
+        avg_train_loss = np.mean(train_losses)
+        avg_train_h1 = np.mean(train_h1_losses)
+        
+        # Evaluation phase
+        if epoch % eval_interval == 0 or epoch == n_epochs - 1:
+            model.eval()
+            test_h1_losses = []
+            test_l2_losses = []
+            
+            with torch.no_grad():
+                for batch in test_loader:
+                    # Preprocess data (data_processor expects and returns a dict)
+                    if data_processor is not None:
+                        data_processor.eval()  # Set to eval mode for inverse normalization
+                        batch = data_processor.preprocess(batch)
+                        x = batch["x"]
+                        y = batch["y"]
+                    else:
+                        x = batch["x"].to(device)
+                        y = batch["y"].to(device)
+                    
+                    out = model(x)
+                    
+                    if data_processor is not None:
+                        out, _ = data_processor.postprocess(out, batch)
+                    
+                    h1_val = h1_loss(out, y)
+                    l2_val = l2_loss(out, y)
+                    
+                    test_h1_losses.append(h1_val.item())
+                    test_l2_losses.append(l2_val.item())
+            
+            avg_test_h1 = np.mean(test_h1_losses)
+            avg_test_l2 = np.mean(test_l2_losses)
+            
+            # Store losses
+            history["epochs"].append(epoch + 1)
+            history["train_loss"].append(avg_train_loss)
+            history["train_h1"].append(avg_train_h1)
+            history["test_h1"].append(avg_test_h1)
+            history["test_l2"].append(avg_test_l2)
+            
+            # Print progress
+            print(f"Epoch {epoch+1}/{n_epochs} | "
+                  f"Train Loss: {avg_train_loss:.6f} | "
+                  f"Train H1: {avg_train_h1:.6f} | "
+                  f"Test H1: {avg_test_h1:.6f} | "
+                  f"Test L2: {avg_test_l2:.6f}")
+        else:
+            # Store training losses only (no evaluation)
+            history["epochs"].append(epoch + 1)
+            history["train_loss"].append(avg_train_loss)
+            history["train_h1"].append(avg_train_h1)
+            history["test_h1"].append(None)
+            history["test_l2"].append(None)
+            
+            print(f"Epoch {epoch+1}/{n_epochs} | Train Loss: {avg_train_loss:.6f} | Train H1: {avg_train_h1:.6f}")
+        
+        # Save checkpoint if needed
+        if save_dir and (epoch % eval_interval == 0 or epoch == n_epochs - 1):
+            checkpoint_path = save_dir / f"checkpoint_epoch_{epoch+1}.pt"
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "train_loss": avg_train_loss,
+                "test_h1": history["test_h1"][-1] if history["test_h1"][-1] is not None else None,
+                "test_l2": history["test_l2"][-1] if history["test_l2"][-1] is not None else None,
+            }, checkpoint_path)
+    
+    # Save final model
+    if save_dir:
+        final_checkpoint_path = save_dir / "final_model.pt"
+        torch.save({
+            "epoch": n_epochs,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "train_loss": history["train_loss"][-1],
+            "test_h1": history["test_h1"][-1] if history["test_h1"][-1] is not None else None,
+            "test_l2": history["test_l2"][-1] if history["test_l2"][-1] is not None else None,
+            "dimension": dimension,
+            "n_modes": n_modes,
+            "hidden_channels": hidden_channels,
+            "n_layers": n_layers,
+        }, final_checkpoint_path)
+        print(f"\nFinal model saved to {final_checkpoint_path}")
+    
+    # Save training history to JSON
+    history_file = logs_dir / "training_history.json"
+    with open(history_file, 'w') as f:
+        json.dump(history, f, indent=2)
+    print(f"Training history saved to {history_file}")
+    
+    # Plot training curves
+    print("\nGenerating training curves...")
+    plot_training_curves(history, logs_dir)
     
     print("=" * 80)
     print("Training completed!")
     
     return model, trainer, data_processor
+
+
+def plot_training_curves(history: dict, output_dir: Path):
+    """Plot training curves for losses.
+    
+    Args:
+        history: Dictionary with training history containing:
+            - epochs: list of epoch numbers
+            - train_loss: list of training losses
+            - train_h1: list of training H1 losses
+            - test_h1: list of test H1 losses (may contain None)
+            - test_l2: list of test L2 losses (may contain None)
+        output_dir: Directory to save plots
+    """
+    epochs = history["epochs"]
+    
+    # Filter out None values for test losses
+    test_epochs = [e for e, v in zip(epochs, history["test_h1"]) if v is not None]
+    test_h1_values = [v for v in history["test_h1"] if v is not None]
+    test_l2_values = [v for v in history["test_l2"] if v is not None]
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Plot 1: Training Loss
+    ax1 = axes[0, 0]
+    ax1.plot(epochs, history["train_loss"], 'b-', linewidth=2, label='Training Loss (H1)', marker='o', markersize=4)
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Loss', fontsize=12)
+    ax1.set_title('Training Loss vs Epoch', fontsize=13, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=11)
+    ax1.set_xlim(1, max(epochs))
+    
+    # Plot 2: Training H1 Loss
+    ax2 = axes[0, 1]
+    ax2.plot(epochs, history["train_h1"], 'g-', linewidth=2, label='Training H1 Loss', marker='s', markersize=4)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('H1 Loss', fontsize=12)
+    ax2.set_title('Training H1 Loss vs Epoch', fontsize=13, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=11)
+    ax2.set_xlim(1, max(epochs))
+    
+    # Plot 3: Test H1 Loss
+    ax3 = axes[1, 0]
+    if test_epochs:
+        ax3.plot(test_epochs, test_h1_values, 'r-', linewidth=2, label='Test H1 Loss', marker='^', markersize=4)
+        ax3.set_xlabel('Epoch', fontsize=12)
+        ax3.set_ylabel('H1 Loss', fontsize=12)
+        ax3.set_title('Test H1 Loss vs Epoch', fontsize=13, fontweight='bold')
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(fontsize=11)
+        ax3.set_xlim(1, max(epochs))
+    else:
+        ax3.text(0.5, 0.5, 'No test H1 data', ha='center', va='center', transform=ax3.transAxes)
+        ax3.set_title('Test H1 Loss vs Epoch', fontsize=13, fontweight='bold')
+    
+    # Plot 4: Test L2 Loss
+    ax4 = axes[1, 1]
+    if test_epochs:
+        ax4.plot(test_epochs, test_l2_values, 'm-', linewidth=2, label='Test L2 Loss', marker='d', markersize=4)
+        ax4.set_xlabel('Epoch', fontsize=12)
+        ax4.set_ylabel('L2 Loss', fontsize=12)
+        ax4.set_title('Test L2 Loss vs Epoch', fontsize=13, fontweight='bold')
+        ax4.grid(True, alpha=0.3)
+        ax4.legend(fontsize=11)
+        ax4.set_xlim(1, max(epochs))
+    else:
+        ax4.text(0.5, 0.5, 'No test L2 data', ha='center', va='center', transform=ax4.transAxes)
+        ax4.set_title('Test L2 Loss vs Epoch', fontsize=13, fontweight='bold')
+    
+    plt.tight_layout()
+    
+    # Save plot
+    plot_file = output_dir / "training_curves.png"
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+    print(f"Training curves saved to {plot_file}")
+    plt.close(fig)
+    
+    # Also create a combined plot with all metrics
+    fig2, ax = plt.subplots(1, 1, figsize=(10, 6))
+    
+    ax.plot(epochs, history["train_loss"], 'b-', linewidth=2, label='Train Loss (H1)', marker='o', markersize=3, alpha=0.7)
+    ax.plot(epochs, history["train_h1"], 'g-', linewidth=2, label='Train H1', marker='s', markersize=3, alpha=0.7)
+    
+    if test_epochs:
+        ax.plot(test_epochs, test_h1_values, 'r-', linewidth=2, label='Test H1', marker='^', markersize=3)
+        ax.plot(test_epochs, test_l2_values, 'm-', linewidth=2, label='Test L2', marker='d', markersize=3)
+    
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Loss', fontsize=12)
+    ax.set_title('All Training Metrics vs Epoch', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=11, loc='best')
+    ax.set_xlim(1, max(epochs))
+    
+    plt.tight_layout()
+    
+    # Save combined plot
+    plot_file_combined = output_dir / "training_curves_combined.png"
+    plt.savefig(plot_file_combined, dpi=300, bbox_inches='tight')
+    print(f"Combined training curves saved to {plot_file_combined}")
+    plt.close(fig2)
 
 
 def parse_args():
@@ -523,6 +775,12 @@ def parse_args():
         default=None,
         help="Directory to save checkpoints (None to skip)",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory to save logs and plots (default: same as save-dir or auto-generated)",
+    )
     
     return parser.parse_args()
 
@@ -546,6 +804,7 @@ def main():
         use_final_state=not args.use_full_trajectory,
         eval_interval=args.eval_interval,
         save_dir=args.save_dir,
+        output_dir=args.output_dir,
     )
     
     print("\nTraining finished!")

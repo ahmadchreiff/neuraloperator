@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 # Add project root to path for imports
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).parent.parent.parent  # Go up to neuraloperator/
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
@@ -24,43 +24,103 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from fnnoperator.FNNOperator import FNNOperator
+from fnnoperator.models.FNNOperator import FNNOperator
+from fnnoperator.Error_Analysis import compute_spectral_error
+from neuralop.models import FNO
 
 
 def load_model(checkpoint_path: Path, device: torch.device):
-    """Load trained model from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    """Load trained model from checkpoint.
     
-    # Extract model parameters from checkpoint
-    grid_shape = tuple(checkpoint['grid_shape'])
-    in_channels = checkpoint['in_channels']
-    out_channels = checkpoint['out_channels']
-    width = checkpoint['width']
-    depth = checkpoint['depth']
-    n_time_steps = checkpoint.get('n_time_steps', 1)  # Default to 1 for backward compatibility
+    Supports both FNNOperator and FNO models by detecting model type from checkpoint.
+    """
+    # Use weights_only=False for checkpoint loading (PyTorch 2.6+ default changed)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # Create model
-    model = FNNOperator(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        grid_shape=grid_shape,
-        width=width,
-        depth=depth,
-        n_time_steps=n_time_steps,
-    )
+    # Detect model type from checkpoint keys
+    is_fno = 'n_modes' in checkpoint or 'hidden_channels' in checkpoint or 'n_layers' in checkpoint
+    is_fnn = 'width' in checkpoint or 'depth' in checkpoint
     
-    # Load weights
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
-    model.eval()
-    
-    print(f"Model loaded from {checkpoint_path}")
-    print(f"  Grid shape: {grid_shape}")
-    print(f"  In channels: {in_channels}, Out channels: {out_channels}")
-    print(f"  Width: {width}, Depth: {depth}")
-    print(f"  Time steps: {n_time_steps}")
-    if 'test_loss' in checkpoint:
-        print(f"  Test loss: {checkpoint['test_loss']:.6f}")
+    if is_fno:
+        # Load FNO model
+        grid_shape = tuple(checkpoint['grid_shape'])
+        in_channels = checkpoint['in_channels']
+        out_channels = checkpoint['out_channels']
+        hidden_channels = checkpoint.get('hidden_channels', 64)
+        n_layers = checkpoint.get('n_layers', 4)
+        n_modes = checkpoint.get('n_modes', None)
+        dimension = checkpoint.get('dimension', len(grid_shape))
+        
+        # Determine n_modes if not in checkpoint
+        if n_modes is None:
+            if dimension == 1:
+                n_modes = (min(16, grid_shape[0] // 4),)
+            elif dimension == 2:
+                n_modes = (min(16, grid_shape[0] // 4), min(16, grid_shape[1] // 4))
+            else:  # 3D
+                n_modes = (min(8, grid_shape[0] // 4), min(8, grid_shape[1] // 4), min(8, grid_shape[2] // 4))
+        else:
+            n_modes = tuple(n_modes)
+        
+        # Create FNO model
+        model = FNO(
+            n_modes=n_modes,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            hidden_channels=hidden_channels,
+            n_layers=n_layers,
+        )
+        
+        # Load weights
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(device)
+        model.eval()
+        
+        print(f"FNO model loaded from {checkpoint_path}")
+        print(f"  Grid shape: {grid_shape}")
+        print(f"  In channels: {in_channels}, Out channels: {out_channels}")
+        print(f"  Hidden channels: {hidden_channels}, N layers: {n_layers}")
+        print(f"  N modes: {n_modes}")
+        if 'test_loss' in checkpoint:
+            print(f"  Test loss: {checkpoint['test_loss']:.6f}")
+        
+    elif is_fnn:
+        # Load FNNOperator model
+        grid_shape = tuple(checkpoint['grid_shape'])
+        in_channels = checkpoint['in_channels']
+        out_channels = checkpoint['out_channels']
+        width = checkpoint['width']
+        depth = checkpoint['depth']
+        n_time_steps = checkpoint.get('n_time_steps', 1)  # Default to 1 for backward compatibility
+        
+        # Create model
+        model = FNNOperator(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            grid_shape=grid_shape,
+            width=width,
+            depth=depth,
+            n_time_steps=n_time_steps,
+        )
+        
+        # Load weights
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(device)
+        model.eval()
+        
+        print(f"FNNOperator model loaded from {checkpoint_path}")
+        print(f"  Grid shape: {grid_shape}")
+        print(f"  In channels: {in_channels}, Out channels: {out_channels}")
+        print(f"  Width: {width}, Depth: {depth}")
+        print(f"  Time steps: {n_time_steps}")
+        if 'test_loss' in checkpoint:
+            print(f"  Test loss: {checkpoint['test_loss']:.6f}")
+    else:
+        raise ValueError(
+            "Could not determine model type from checkpoint. "
+            "Expected either FNO (n_modes, hidden_channels, n_layers) or "
+            "FNNOperator (width, depth) keys."
+        )
     
     return model, checkpoint
 
@@ -572,15 +632,19 @@ def main():
         return
     
     # Load test data (with full trajectory for temporal visualization)
-    print("\nLoading test data...")
+    print("\n" + "="*60)
+    print("Loading TEST DATA (test.npz)")
+    print("="*60)
     X_test, Y_test, grid_shape, solution_trajectory, time_steps = load_test_data(
         args.data_dir, return_full_trajectory=True
     )
+    print(f"  Data source: {args.data_dir / 'test.npz'}")
     print(f"  Test samples: {len(X_test)}")
     print(f"  Grid shape: {grid_shape}")
     print(f"  Input shape: {X_test.shape}")
     print(f"  Output shape: {Y_test.shape}")
     print(f"  Time steps: {solution_trajectory.shape[1]}")
+    print("="*60)
     
     # Generate predictions
     print("\nGenerating predictions...")
@@ -588,8 +652,14 @@ def main():
     print(f"  Predictions shape: {predictions.shape}")
     
     # Check if model predicts multiple time steps
+    # FNO models don't support multi-time-step prediction, so default to 1
     n_time_steps_model = checkpoint.get('n_time_steps', 1)
-    has_multiple_time_steps = n_time_steps_model > 1
+    # Only FNNOperator supports multi-time-step (FNO always predicts single time step)
+    is_fno_model = 'n_modes' in checkpoint or 'hidden_channels' in checkpoint
+    has_multiple_time_steps = n_time_steps_model > 1 and not is_fno_model
+    
+    # Initialize relative_spectral_error (will be computed in both branches)
+    relative_spectral_error = None
     
     # Calculate overall metrics
     if has_multiple_time_steps:
@@ -609,13 +679,37 @@ def main():
         mse = np.mean((pred_compare - gt_compare) ** 2)
         mae = np.mean(np.abs(pred_compare - gt_compare))
         rmse = np.sqrt(mse)
-        relative_error = mae / (np.abs(gt_compare).mean() + 1e-8) * 100
+        gt_mean_abs = np.abs(gt_compare).mean() + 1e-8
+        relative_error = mae / gt_mean_abs * 100
+        rmse_percent = rmse / gt_mean_abs * 100
+        
+        # Compute spectral error (use final time step for spectral analysis)
+        try:
+            # Remove channel dimension if present for spectral error computation
+            if len(pred_compare.shape) == 4:  # (batch, time, channels, H, W)
+                pred_2d = pred_compare[:, -1, 0, :, :]  # Use final time step, remove channel
+                gt_2d = gt_compare[:, -1, :, :]  # Use final time step
+            elif len(pred_compare.shape) == 3:  # (batch, time, H*W) or (batch, time, H, W)
+                pred_2d = pred_compare[:, -1, :, :] if len(pred_compare.shape) == 4 else pred_compare[:, -1, ...]
+                gt_2d = gt_compare[:, -1, :, :] if len(gt_compare.shape) == 4 else gt_compare[:, -1, ...]
+            else:
+                pred_2d = pred_compare[:, -1, ...]  # Use final time step
+                gt_2d = gt_compare[:, -1, ...]
+            
+            spectral_results = compute_spectral_error(pred_2d, gt_2d, normalize=True)
+            relative_spectral_error = spectral_results['relative_spectral_error']
+        except Exception as e:
+            print(f"  Warning: Could not compute spectral error: {e}")
+            relative_spectral_error = None
         
         print(f"\nOverall Metrics (all {n_time_steps_model} time steps):")
         print(f"  MSE: {mse:.6f}")
         print(f"  MAE: {mae:.6f}")
         print(f"  RMSE: {rmse:.6f}")
-        print(f"  Relative Error: {relative_error:.2f}%")
+        print(f"  RMSE %: {rmse_percent:.2f}%")
+        print(f"  Relative Error (MAE %): {relative_error:.2f}%")
+        if relative_spectral_error is not None:
+            print(f"  Relative Spectral Error: {relative_spectral_error:.6f}")
         
         # Also calculate metrics for final time step only
         final_pred = pred_compare[:, -1, ...]  # (batch, *grid)
@@ -627,19 +721,45 @@ def main():
         print(f"  MSE: {final_mse:.6f}")
         print(f"  MAE: {final_mae:.6f}")
         print(f"  RMSE: {final_rmse:.6f}")
+        
+        # Store relative_spectral_error for metrics (already computed above)
     else:
         # Single time step (final state only)
         Y_test_np = Y_test.numpy()
         mse = np.mean((predictions - Y_test_np) ** 2)
         mae = np.mean(np.abs(predictions - Y_test_np))
         rmse = np.sqrt(mse)
-        relative_error = mae / (np.abs(Y_test_np).mean() + 1e-8) * 100
+        gt_mean_abs = np.abs(Y_test_np).mean() + 1e-8
+        relative_error = mae / gt_mean_abs * 100
+        rmse_percent = rmse / gt_mean_abs * 100
+        
+        # Compute spectral error
+        try:
+            # Remove channel dimension if present for spectral error computation
+            if len(predictions.shape) == 4:  # (batch, channels, H, W)
+                pred_2d = predictions[:, 0, :, :]  # Remove channel dim
+                gt_2d = Y_test_np[:, 0, :, :]
+            elif len(predictions.shape) == 3:  # (batch, H, W)
+                pred_2d = predictions
+                gt_2d = Y_test_np.squeeze(1) if Y_test_np.shape[1] == 1 else Y_test_np
+            else:
+                pred_2d = predictions
+                gt_2d = Y_test_np
+            
+            spectral_results = compute_spectral_error(pred_2d, gt_2d, normalize=True)
+            relative_spectral_error = spectral_results['relative_spectral_error']
+        except Exception as e:
+            print(f"  Warning: Could not compute spectral error: {e}")
+            relative_spectral_error = None
         
         print(f"\nOverall Metrics (final state only):")
         print(f"  MSE: {mse:.6f}")
         print(f"  MAE: {mae:.6f}")
         print(f"  RMSE: {rmse:.6f}")
-        print(f"  Relative Error: {relative_error:.2f}%")
+        print(f"  RMSE %: {rmse_percent:.2f}%")
+        print(f"  Relative Error (MAE %): {relative_error:.2f}%")
+        if relative_spectral_error is not None:
+            print(f"  Relative Spectral Error: {relative_spectral_error:.6f}")
     
     # Load initial conditions for visualization
     test_data = np.load(args.data_dir / "test.npz", allow_pickle=True)
@@ -703,7 +823,9 @@ def main():
         'mse': float(mse),
         'mae': float(mae),
         'rmse': float(rmse),
-        'relative_error_percent': float(relative_error),
+        'rmse_percent': float(rmse_percent),
+        'relative_error_percent': float(relative_error),  # MAE-based relative error
+        'relative_spectral_error': float(relative_spectral_error) if relative_spectral_error is not None else None,
         'n_samples': len(X_test),
         'n_visualized': min(args.n_samples, len(X_test)),
     }

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from fnnoperator.FNN import FNN
+from fnnoperator.models.FNN import FNN
 
 
 class FNNOperator(FNN):

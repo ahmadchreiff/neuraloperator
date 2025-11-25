@@ -1,6 +1,15 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+import sys
+from pathlib import Path
+
+# Add project root to path for imports
+project_root = Path(__file__).parent.parent.parent.parent  # Go up to neuraloperator/
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from fnnoperator.Error_Analysis import compute_spectral_error
 
 class FNNTrainer:
     def __init__(
@@ -85,6 +94,33 @@ class FNNTrainer:
             self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
         else:
             self.test_loader = None
+    
+    def _compute_loss(self, y_pred, y_target, x_input=None):
+        """
+        Compute loss, handling physics-informed losses that need input.
+        
+        Args:
+            y_pred: Model predictions
+            y_target: Target values
+            x_input: Input values (needed for physics-informed losses)
+        
+        Returns:
+            Loss value
+        """
+        # Check if loss function needs u_input (PhysicsInformedLoss or CombinedLoss containing it)
+        if 'PhysicsInformedLoss' in str(type(self.loss_fn)):
+            # Direct PhysicsInformedLoss
+            return self.loss_fn(y_pred, y_target, u_input=x_input)
+        elif hasattr(self.loss_fn, 'losses'):
+            # CombinedLoss - check if any loss is PhysicsInformedLoss
+            has_physics = any(
+                'PhysicsInformedLoss' in str(type(loss)) for loss in self.loss_fn.losses
+            )
+            if has_physics and x_input is not None:
+                return self.loss_fn(y_pred, y_target, u_input=x_input)
+        
+        # Default: standard loss computation
+        return self.loss_fn(y_pred, y_target)
 
     def train_epoch(self):
         self.model.train() # set the model to training mode
@@ -99,12 +135,12 @@ class FNNTrainer:
             if self.use_amp and self.scaler is not None:
                 with torch.cuda.amp.autocast():
                     y_pred = self.model(X_batch) # forward pass
-                    loss = self.loss_fn(y_pred, Y_batch) / self.gradient_accumulation_steps # scale loss for accumulation
+                    loss = self._compute_loss(y_pred, Y_batch, X_batch) / self.gradient_accumulation_steps # scale loss for accumulation
                 
                 self.scaler.scale(loss).backward() # backward pass with scaling
             else:
                 y_pred = self.model(X_batch) # forward pass
-                loss = self.loss_fn(y_pred, Y_batch) / self.gradient_accumulation_steps # scale loss for accumulation
+                loss = self._compute_loss(y_pred, Y_batch, X_batch) / self.gradient_accumulation_steps # scale loss for accumulation
                 loss.backward() # backward pass
 
             # Update weights only after accumulating gradients
@@ -124,10 +160,14 @@ class FNNTrainer:
 
     def validate(self):
         if self.val_loader is None:
-            return None
+            return None, None, None
         
         self.model.eval() # set the model to evaluation mode
         val_loss = 0.0
+        mse_loss = 0.0
+        all_preds = []
+        all_targets = []
+        mse_fn = nn.MSELoss()
 
         with torch.no_grad(): # disable gradient computation since we are not training
             for X_batch, Y_batch in self.val_loader:
@@ -137,22 +177,67 @@ class FNNTrainer:
                 if self.use_amp and self.scaler is not None:
                     with torch.cuda.amp.autocast():
                         y_pred = self.model(X_batch)
-                        loss = self.loss_fn(y_pred, Y_batch)
+                        loss = self._compute_loss(y_pred, Y_batch, X_batch)
+                        # Also compute MSE separately for monitoring
+                        mse = mse_fn(y_pred, Y_batch)
                 else:
                     y_pred = self.model(X_batch)
-                    loss = self.loss_fn(y_pred, Y_batch)
+                    loss = self._compute_loss(y_pred, Y_batch, X_batch)
+                    # Also compute MSE separately for monitoring
+                    mse = mse_fn(y_pred, Y_batch)
                 
                 val_loss += loss.item() * X_batch.size(0)
+                mse_loss += mse.item() * X_batch.size(0)
+                
+                # Collect predictions and targets for spectral error computation
+                all_preds.append(y_pred.detach().cpu())
+                all_targets.append(Y_batch.detach().cpu())
 
-        return val_loss / len(self.val_loader.dataset) # average over number of samples in the dataset
+        val_loss_avg = val_loss / len(self.val_loader.dataset)
+        mse_loss_avg = mse_loss / len(self.val_loader.dataset)
+        
+        # Compute spectral errors
+        try:
+            # Concatenate all batches
+            preds_concat = torch.cat(all_preds, dim=0).numpy()
+            targets_concat = torch.cat(all_targets, dim=0).numpy()
+            
+            # Handle different output shapes: (batch, channels, H, W) or (batch, time, channels, H, W)
+            # Remove channel dimension and handle time steps
+            if len(preds_concat.shape) == 4:  # (batch, channels, H, W)
+                preds_2d = preds_concat[:, 0, :, :]  # Remove channel dim
+                targets_2d = targets_concat[:, 0, :, :]
+            elif len(preds_concat.shape) == 5:  # (batch, time, channels, H, W)
+                # Use final time step for spectral error
+                preds_2d = preds_concat[:, -1, 0, :, :]
+                targets_2d = targets_concat[:, -1, 0, :, :]
+            else:
+                preds_2d = preds_concat
+                targets_2d = targets_concat
+            
+            # Compute spectral errors
+            spectral_results = compute_spectral_error(preds_2d, targets_2d, normalize=True)
+            # Use relative spectral error: ||FFT_pred - FFT_true||_2 / ||FFT_true||_2
+            spectral_error = spectral_results['relative_spectral_error']
+        except Exception as e:
+            # If spectral error computation fails, return None
+            if self.verbose:
+                print(f"Warning: Could not compute spectral error: {e}")
+            spectral_error = None
+        
+        return val_loss_avg, mse_loss_avg, spectral_error
     
     def test(self):
         if self.test_loader is None:
-            return None
+            return None, None, None, None
         
         self.model.eval()
         test_loss = 0.0
+        test_mse = 0.0
         test_preds = [] # predictions for each batch
+        all_preds = []
+        all_targets = []
+        mse_fn = nn.MSELoss()
 
         with torch.no_grad():
             for X_batch, Y_batch in self.test_loader:
@@ -160,28 +245,68 @@ class FNNTrainer:
                 Y_batch = Y_batch.to(self.device)
 
                 y_pred = self.model(X_batch)
-                loss = self.loss_fn(y_pred, Y_batch)
+                loss = self._compute_loss(y_pred, Y_batch, X_batch)
+                mse = mse_fn(y_pred, Y_batch)
                 test_loss += loss.item() * X_batch.size(0)
+                test_mse += mse.item() * X_batch.size(0)
                 test_preds.append(y_pred.detach().cpu().numpy())
+                
+                # Collect for spectral error computation
+                all_preds.append(y_pred.detach().cpu())
+                all_targets.append(Y_batch.detach().cpu())
 
-        return test_loss / len(self.test_loader.dataset), test_preds
+        test_loss_avg = test_loss / len(self.test_loader.dataset)
+        test_mse_avg = test_mse / len(self.test_loader.dataset)
+        
+        # Compute spectral errors
+        try:
+            # Concatenate all batches
+            preds_concat = torch.cat(all_preds, dim=0).numpy()
+            targets_concat = torch.cat(all_targets, dim=0).numpy()
+            
+            # Handle different output shapes
+            if len(preds_concat.shape) == 4:  # (batch, channels, H, W)
+                preds_2d = preds_concat[:, 0, :, :]
+                targets_2d = targets_concat[:, 0, :, :]
+            elif len(preds_concat.shape) == 5:  # (batch, time, channels, H, W)
+                # Use final time step for spectral error
+                preds_2d = preds_concat[:, -1, 0, :, :]
+                targets_2d = targets_concat[:, -1, 0, :, :]
+            else:
+                preds_2d = preds_concat
+                targets_2d = targets_concat
+            
+            # Compute spectral errors
+            spectral_results = compute_spectral_error(preds_2d, targets_2d, normalize=True)
+            # Use relative spectral error: ||FFT_pred - FFT_true||_2 / ||FFT_true||_2
+            spectral_error = spectral_results['relative_spectral_error']
+        except Exception as e:
+            if self.verbose:
+                print(f"Warning: Could not compute spectral error: {e}")
+            spectral_error = None
+
+        return test_loss_avg, test_mse_avg, spectral_error, test_preds
 
     def fit(self):
         """
         Train the model for n_epochs with validation monitoring.
         
         Returns:
-            dict: Training history with 'train_loss' and 'val_loss' lists.
+            dict: Training history with 'train_loss', 'val_loss', 'val_spectral_error' lists.
                 Note: Test evaluation should be done separately using test() method.
         """
-        history = {'train_loss': [], 'val_loss': []}
+        history = {'train_loss': [], 'val_loss': [], 'val_mse': [], 'val_spectral_error': []}
         
         for epoch in range(self.n_epochs):
+            # Reset epoch stats for combined loss debug (if using combined loss)
+            if hasattr(self.loss_fn, 'reset_epoch_stats'):
+                self.loss_fn.reset_epoch_stats()
+            
             # Train for one epoch
             train_loss = self.train_epoch()
             
             # Validate (if validation data is available)
-            val_loss = self.validate()
+            val_loss, val_mse, val_spectral = self.validate()
             
             # Update learning rate
             self.scheduler.step()
@@ -189,15 +314,22 @@ class FNNTrainer:
             # Store history
             history['train_loss'].append(train_loss)
             history['val_loss'].append(val_loss if val_loss is not None else None)
+            history['val_mse'].append(val_mse if val_mse is not None else None)
+            history['val_spectral_error'].append(val_spectral if val_spectral is not None else None)
             
-            # Print progress
+            # Print progress (single line, no duplicates)
             if self.verbose:
                 val_str = f"{val_loss:.6f}" if val_loss is not None else "N/A"
+                val_mse_str = f"{val_mse:.6f}" if val_mse is not None else "N/A"
+                val_spec_str = f"{val_spectral:.6f}" if val_spectral is not None else "N/A"
                 current_lr = self.optimizer.param_groups[0]['lr']
-                print(f"Epoch {epoch+1:4d}/{self.n_epochs} | "
-                      f"Train Loss: {train_loss:.6f} | "
-                      f"Val Loss: {val_str} | "
-                      f"LR: {current_lr:.2e}")
+                # Single print statement - ensure no duplicates
+                message = f"Epoch {epoch+1:4d}/{self.n_epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_str} | Val MSE: {val_mse_str} | Val Spectral: {val_spec_str} | LR: {current_lr:.2e}"
+                print(message, flush=True)
+            
+            # Print combined loss debug info if enabled
+            if hasattr(self.loss_fn, 'print_epoch_stats'):
+                self.loss_fn.print_epoch_stats(epoch + 1)
         
         return history
 
